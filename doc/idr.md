@@ -189,6 +189,13 @@ Note some of the `ElementNode.Data` values are from its
 [schema](../extensions/omniv21/samples/csv2/1_single_row.schema.json)
 to avoid column name containing space, which isn't xpath query friendly.
 
+For the (deprecated but still supported) `csv` file format, the root `DocumentNode` of each
+returned record also carries the record's 1-based inclusive line range in the input file in its
+`FormatSpecific` field (of type `csv.RecordLines`, retrievable via `csv.RecordLinesOf(node)`).
+Because a quoted field can span multiple physical lines, the start and end lines of a record may
+differ. This trace info allows a returned record to be located and re-read in the original input
+file.
+
 ## EDI
 
 Here is snippet from a [sample EDI](../extensions/omniv21/samples/edi/1_canadapost_edi_214.input.txt):

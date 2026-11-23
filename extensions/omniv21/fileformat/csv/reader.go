@@ -1,6 +1,7 @@
 package csv
 
 import (
+	stdcsv "encoding/csv"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +14,36 @@ import (
 
 	"github.com/jf-tech/omniparser/idr"
 )
+
+// RecordLines describes the 1-based, inclusive physical line range a CSV record occupies
+// in the input file. A record can span multiple physical lines when it contains quoted
+// fields with embedded newlines, in which case Start < End.
+//
+// The RecordLines of a successfully ingested record is attached to the record's IDR root
+// node (in idr.Node.FormatSpecific) as trace info, so the record can be traced back to,
+// and re-read from, the original input file. It is also used to point error messages at
+// the real line range of a bad record.
+type RecordLines struct {
+	Start int // 1-based line number of the first physical line of the record.
+	End   int // 1-based line number of the last physical line of the record, inclusive.
+}
+
+// String returns a human readable representation of the line range, collapsing it into
+// a single "line N" when the record occupies only one physical line.
+func (l RecordLines) String() string {
+	if l.End <= l.Start {
+		return fmt.Sprintf("line %d", l.Start)
+	}
+	return fmt.Sprintf("lines [%d,%d]", l.Start, l.End)
+}
+
+// RecordLinesOf returns the RecordLines trace info attached to the IDR root node of a
+// record previously returned by the CSV reader. The second return value indicates
+// whether such trace info is present on the node.
+func RecordLinesOf(n *idr.Node) (RecordLines, bool) {
+	lines, ok := n.FormatSpecific.(RecordLines)
+	return lines, ok
+}
 
 // ErrInvalidHeader indicates the header of the CSV input is corrupted, mismatched, or simply
 // unreadable. This is a fatal, non-continuable error.
@@ -36,6 +67,9 @@ type reader struct {
 	xpath         *xpath.Expr
 	r             *ios.LineNumReportingCsvReader
 	headerChecked bool
+	// lastRecordLines is the line range of the record most recently read from the
+	// input. It's nil before the first record is read (e.g. during header processing).
+	lastRecordLines *RecordLines
 }
 
 func (r *reader) Read() (*idr.Node, error) {
@@ -52,13 +86,49 @@ read:
 		return nil, io.EOF
 	}
 	if err != nil {
-		return nil, r.FmtErr("failed to fetch record: %s", err.Error())
+		return nil, r.fmtErr(r.errRecordLines(err), "failed to fetch record: %s", err.Error())
 	}
+	lines := r.recordLines(record)
+	r.lastRecordLines = &lines
 	n := r.recordToNode(record)
+	n.FormatSpecific = lines
 	if r.xpath != nil && !idr.MatchAny(n, r.xpath) {
 		goto read
 	}
 	return n, nil
+}
+
+// recordLines computes the 1-based inclusive physical line range a just-read record
+// occupies in the input. After a successful Read, r.r.LineNum() points at the record's
+// last physical line. A record spans multiple physical lines only when its quoted fields
+// embed newlines, and those newlines are preserved in the parsed field values, so the
+// number of physical lines the record covers is 1 plus the total number of newlines
+// across all its fields. Deriving the start line this way (instead of using the previous
+// record's end line + 1) also correctly skips over blank lines that the csv reader
+// auto-skips before the record.
+func (r *reader) recordLines(record []string) RecordLines {
+	end := r.r.LineNum()
+	span := 1
+	for _, field := range record {
+		span += strings.Count(field, "\n")
+	}
+	return RecordLines{Start: end - span + 1, End: end}
+}
+
+// errRecordLines computes the line range of a record whose read failed. A csv.ParseError
+// already carries the true start/end lines of the offending record; for any other error
+// (e.g. an underlying IO failure), the best we know is the line the reader was at when
+// the failure occurred.
+func (r *reader) errRecordLines(err error) RecordLines {
+	var parseErr *stdcsv.ParseError
+	if errors.As(err, &parseErr) {
+		return RecordLines{Start: parseErr.StartLine, End: parseErr.Line}
+	}
+	line := r.r.LineNum()
+	if line < 1 {
+		line = 1
+	}
+	return RecordLines{Start: line, End: line}
 }
 
 func (r *reader) checkHeader() error {
@@ -69,20 +139,20 @@ func (r *reader) checkHeader() error {
 	}
 	err = r.jumpTo(*r.decl.HeaderRowIndex - 1)
 	if err != nil {
-		return ErrInvalidHeader(r.fmtErrStr("unable to read header: %s", err.Error()))
+		return ErrInvalidHeader(r.fmtErrStr(r.currentLines(), "unable to read header: %s", err.Error()))
 	}
 	header, err = r.r.Read()
 	if err != nil {
-		return ErrInvalidHeader(r.fmtErrStr("unable to read header: %s", err.Error()))
+		return ErrInvalidHeader(r.fmtErrStr(r.currentLines(), "unable to read header: %s", err.Error()))
 	}
 	if len(header) < len(r.decl.Columns) {
-		return ErrInvalidHeader(r.fmtErrStr(
+		return ErrInvalidHeader(r.fmtErrStr(r.currentLines(),
 			"actual header column size (%d) is less than the size (%d) declared in file_declaration.columns in schema",
 			len(header), len(r.decl.Columns)))
 	}
 	for index, column := range r.decl.Columns {
 		if strings.TrimSpace(header[index]) != strings.TrimSpace(column.Name) {
-			return ErrInvalidHeader(r.fmtErrStr(
+			return ErrInvalidHeader(r.fmtErrStr(r.currentLines(),
 				"header column[%d] '%s' does not match declared column name '%s' in schema",
 				index+1, strings.TrimSpace(header[index]), strings.TrimSpace(column.Name)))
 		}
@@ -136,11 +206,26 @@ func (r *reader) IsContinuableError(err error) bool {
 }
 
 func (r *reader) FmtErr(format string, args ...interface{}) error {
-	return errors.New(r.fmtErrStr(format, args...))
+	return r.fmtErr(r.currentLines(), format, args...)
 }
 
-func (r *reader) fmtErrStr(format string, args ...interface{}) string {
-	return fmt.Sprintf("input '%s' line %d: %s", r.inputName, r.r.LineNum(), fmt.Sprintf(format, args...))
+// currentLines returns the line range of the record most recently read from the input;
+// if no record has been read yet (e.g. an error occurs during header processing), it
+// returns the reader's current line.
+func (r *reader) currentLines() RecordLines {
+	if r.lastRecordLines != nil {
+		return *r.lastRecordLines
+	}
+	line := r.r.LineNum()
+	return RecordLines{Start: line, End: line}
+}
+
+func (r *reader) fmtErr(lines RecordLines, format string, args ...interface{}) error {
+	return errors.New(r.fmtErrStr(lines, format, args...))
+}
+
+func (r *reader) fmtErrStr(lines RecordLines, format string, args ...interface{}) string {
+	return fmt.Sprintf("input '%s' %s: %s", r.inputName, lines.String(), fmt.Sprintf(format, args...))
 }
 
 // NewReader creates an FormatReader for CSV file format.

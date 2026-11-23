@@ -85,6 +85,15 @@ quotes `'`.
     based transform hard/impossible later. In situations like this, we strongly advise schema writer to
     use `alias` to assign an alias to the column that is XPath friendly, such as containing no spaces.
 
+## Record Line Tracking
+
+A quoted CSV field can embed newlines and thus span multiple physical lines. To keep bad records
+locatable, reader errors report the offending record's real 1-based inclusive line range, e.g.
+`input 'ledger.csv' lines [102,107]: failed to fetch record: ...`. Each successfully ingested
+record also carries its line range on its IDR root node (`csv.RecordLines` in the node's
+`FormatSpecific` field, retrievable via `csv.RecordLinesOf`), so a transformed output record can
+be traced back to and re-read from the original input file.
+
 ## CSV Specific IDR Structure
 
 See [here](./idr.md#csv-aka-delimited) for more details.
